@@ -383,54 +383,149 @@ def test_probe_and_config_commands():
         check("_probe_port closed the probe port",
               _FakeSerialFactory.instances[-1].closed)
 
-        # configuration command sequence (bytes must match the protocol)
+        # _write_config: content+rate only (115200 path -> NO baud write);
+        # per-register bursts: each = unlock + cmd + save in ONE write()
         ser = FakeSer()
         r2 = IMUReader.__new__(IMUReader)
-        r2._probe_port = lambda port, baud, t: baud == 115200
         orig_serial_cls = imu_reader.serial.Serial
         imu_reader.serial.Serial = lambda *a, **k: ser
+        b_content = (b"\xFF\xAA\x69\x88\xB5" + b"\xFF\xAA\x02\x06\x00"
+                     + b"\xFF\xAA\x00\x00\x00")
+        b_rate = (b"\xFF\xAA\x69\x88\xB5" + b"\xFF\xAA\x03\x08\x00"
+                  + b"\xFF\xAA\x00\x00\x00")
         try:
-            baud = r2._configure_device("/dev/ttyUSB0", 1.0)
-            check("_configure_device returns 115200", baud == 115200)
-            check("unlock command written",
-                  ser.written[0] == b"\xFF\xAA\x69\x88\xB5",
-                  str(ser.written[0]))
-            check("content reg write", ser.written[1] == b"\xFF\xAA\x02\x03\x00",
-                  str(ser.written[1]))
-            check("rate reg write", ser.written[2] == b"\xFF\xAA\x03\x08\x00",
-                  str(ser.written[2]))
-            check("baud reg write", ser.written[3] == b"\xFF\xAA\x04\x06\x00",
-                  str(ser.written[3]))
-            check("exactly 4 commands written", len(ser.written) == 4,
-                  "n=%d" % len(ser.written))
-            check("config port closed", ser.closed)
+            r2._write_config("/dev/ttyUSB0", 115200, include_baud=False)
+            check("write_config per-register bursts: 2 writes",
+                  len(ser.written) == 2, "n=%d" % len(ser.written))
+            check("write_config content burst bytes",
+                  ser.written[0] == b_content, str(ser.written[0]))
+            check("write_config rate burst bytes",
+                  ser.written[1] == b_rate, str(ser.written[1]))
+            check("write_config no baud write",
+                  all(b"\xFF\xAA\x04\x06\x00" not in w for w in ser.written))
+            check("write_config closed the port", ser.closed)
         finally:
             imu_reader.serial.Serial = orig_serial_cls
 
-        # config fallback: 115200 silent, 9600 alive -> warn + use 9600
+        # _write_config with baud (factory 9600 path -> 3rd baud burst)
         ser2 = FakeSer()
-        r3 = IMUReader.__new__(IMUReader)
-        r3._probe_port = lambda port, baud, t: baud == 9600
         imu_reader.serial.Serial = lambda *a, **k: ser2
+        b_baud = (b"\xFF\xAA\x69\x88\xB5" + b"\xFF\xAA\x04\x06\x00"
+                  + b"\xFF\xAA\x00\x00\x00")
         try:
-            baud = r3._configure_device("/dev/ttyUSB0", 1.0)
-            check("_configure_device falls back to 9600", baud == 9600)
+            r2._write_config("/dev/ttyUSB0", 9600, include_baud=True)
+            check("write_config factory: 3 bursts", len(ser2.written) == 3,
+                  "n=%d" % len(ser2.written))
+            check("write_config factory: baud burst last",
+                  ser2.written[2] == b_baud, str(ser2.written[2]))
+            check("write_config factory: port closed", ser2.closed)
         finally:
             imu_reader.serial.Serial = orig_serial_cls
+    finally:
+        imu_reader.serial = real_serial
 
-        # config total failure -> IMUError
-        r4 = IMUReader.__new__(IMUReader)
-        r4._probe_port = lambda port, baud, t: False
-        imu_reader.serial.Serial = lambda *a, **k: FakeSer()
-        try:
-            try:
-                r4._configure_device("/dev/ttyUSB0", 1.0)
-                check("dead module -> IMUError", False)
-            except IMUError as exc:
-                check("dead module -> IMUError", "stopped answering" in str(exc),
-                      str(exc))
-        finally:
-            imu_reader.serial.Serial = orig_serial_cls
+
+def test_open_on_device():
+    """_open_on_device: 115200-alive modules are STILL (re)configured with
+    content+rate (no baud write); factory 9600 gets the full config; a
+    module that goes silent at 115200 after config falls back to the 9600
+    path; a totally dead device returns False."""
+    real_serial = imu_reader.serial
+
+    # scenario 1: 115200 alive before AND after config -> final 115200,
+    # unlock+content+rate written, NO baud write, config sent at 115200
+    class Env1:
+        serials = []
+
+    class FakeMod1:
+        SerialException = real_serial.SerialException
+
+        @staticmethod
+        def Serial(port, baud, **kw):
+            s = FakeSer([frame(PKT_ACCEL, 1, 2, 3)])
+            s.port, s.baud = port, baud
+            Env1.serials.append(s)
+            return s
+
+    imu_reader.serial = FakeMod1
+    try:
+        r1 = IMUReader.__new__(IMUReader)
+        check("open_on_device 115200-alive -> True",
+              r1._open_on_device("/dev/ttyUSB0", 0.3) and r1.baud == 115200)
+        written = [w for s in Env1.serials for w in s.written]
+        check("115200-alive: unlock+content+rate in burst",
+              any(b"\xFF\xAA\x69\x88\xB5" in w for w in written)
+              and any(b"\xFF\xAA\x02\x06\x00" in w for w in written)
+              and any(b"\xFF\xAA\x03\x08\x00" in w for w in written))
+        check("115200-alive: save in burst",
+              any(b"\xFF\xAA\x00\x00\x00" in w for w in written))
+        check("115200-alive: NO baud write",
+              all(b"\xFF\xAA\x04\x06\x00" not in w for w in written))
+        cfg = [s for s in Env1.serials if s.written]
+        check("115200-alive: config sent at 115200",
+              cfg and all(s.baud == 115200 for s in cfg),
+              "config bauds=%s" % [s.baud for s in cfg])
+    finally:
+        imu_reader.serial = real_serial
+
+    # scenario 2: 115200 silent AFTER config, 9600 alive -> full config at
+    # 9600 (incl. baud), then 115200 verified -> final baud 115200
+    class Env2:
+        serials = []
+        n115 = 0
+
+    def mk2(port, baud, **kw):
+        if baud == 115200:
+            Env2.n115 += 1
+            # opens #1 (probe) and #2 (config) see frames; #3 (post-config
+            # verify) is silent; #4 (post-9600-config verify) and #5 (final)
+            # see frames again
+            stream = [] if Env2.n115 == 3 else [frame(PKT_ACCEL, 1, 2, 3)]
+        else:
+            stream = [frame(PKT_ACCEL, 1, 2, 3)]
+        s = FakeSer(stream)
+        s.port, s.baud = port, baud
+        Env2.serials.append(s)
+        return s
+
+    class FakeMod2:
+        SerialException = real_serial.SerialException
+
+        @staticmethod
+        def Serial(port, baud, **kw):
+            return mk2(port, baud, **kw)
+
+    imu_reader.serial = FakeMod2
+    try:
+        r2 = IMUReader.__new__(IMUReader)
+        check("silent-115200 -> recovers via 9600 path at 115200",
+              r2._open_on_device("/dev/ttyUSB0", 0.3) and r2.baud == 115200)
+        written = [w for s in Env2.serials for w in s.written]
+        check("recovery path wrote baud reg",
+              any(b"\xFF\xAA\x04\x06\x00" in w for w in written))
+        check("recovery path wrote content+rate",
+              any(b"\xFF\xAA\x02\x06\x00" in w for w in written)
+              and any(b"\xFF\xAA\x03\x08\x00" in w for w in written))
+        cfg = [s for s in Env2.serials if s.written]
+        check("recovery path configured at 9600",
+              cfg and any(s.baud == 9600 for s in cfg),
+              "config bauds=%s" % [s.baud for s in cfg])
+    finally:
+        imu_reader.serial = real_serial
+
+    # scenario 3: everything dead -> False (caller raises the readable error)
+    class FakeMod3:
+        SerialException = real_serial.SerialException
+
+        @staticmethod
+        def Serial(port, baud, **kw):
+            return FakeSer([])
+
+    imu_reader.serial = FakeMod3
+    try:
+        r3 = IMUReader.__new__(IMUReader)
+        check("dead device -> _open_on_device False",
+              r3._open_on_device("/dev/ttyUSB0", 0.3) is False)
     finally:
         imu_reader.serial = real_serial
 
@@ -458,7 +553,8 @@ def test_full_open_flow():
         def Serial(port, baud, **kw):
             return mk_serial(port, baud, **kw)
 
-    # case A: module already at 115200 -> used as-is, zero writes
+    # case A: module already at 115200 -> STILL (re)configured: unlock +
+    # content + rate written, but NO baud write (baud stays 115200)
     Env.stream = [frame(PKT_ACCEL, 16384, 0, 0)]
     Env.serials = []
     imu_reader.serial = FakeModule
@@ -467,8 +563,45 @@ def test_full_open_flow():
         r = IMUReader(probe_timeout=0.3)
         check("auto-open picks 115200 when configured", r.baud == 115200
               and r.port == "/dev/ttyUSB0", "baud=%s port=%s" % (r.baud, r.port))
-        check("no config writes in the pre-configured case",
-              all(len(s.written) == 0 for s in Env.serials))
+        written = [w for s in Env.serials for w in s.written]
+        check("pre-configured case writes unlock burst",
+              any(b"\xFF\xAA\x69\x88\xB5" in w for w in written))
+        check("pre-configured case writes content reg",
+              any(b"\xFF\xAA\x02\x06\x00" in w for w in written))
+        check("pre-configured case writes rate reg",
+              any(b"\xFF\xAA\x03\x08\x00" in w for w in written))
+        check("pre-configured case does NOT write baud reg",
+              all(b"\xFF\xAA\x04\x06\x00" not in w for w in written))
+        check("pre-configured case writes save",
+              any(b"\xFF\xAA\x00\x00\x00" in w for w in written))
+        cfg = [s for s in Env.serials if s.written]
+        check("pre-configured case: config sent at 115200",
+              cfg and all(s.baud == 115200 for s in cfg),
+              "config bauds=%s" % [s.baud for s in cfg])
+    finally:
+        imu_reader.serial = real_serial
+        imu_reader._find_devices = real_find
+
+    # case A2: 115200 alive but WRONG output config (200 Hz band, 5 packet
+    # types 0x50..0x54, like the real module) -> same treatment: content+rate
+    # rewritten at 115200, no baud write, final baud 115200
+    Env.stream = [frame(0x50, 0, 0, 0), frame(PKT_ACCEL, 0, 0, 2048),
+                  frame(PKT_GYRO, 0, 0, 0), frame(0x53, 0, 0, 0),
+                  frame(0x54, 0, 0, 0)]
+    Env.serials = []
+    imu_reader.serial = FakeModule
+    imu_reader._find_devices = lambda: ["/dev/ttyUSB0"]
+    try:
+        r = IMUReader(probe_timeout=0.3)
+        check("wrong-rate module still opened at 115200", r.baud == 115200,
+              "baud=%s" % r.baud)
+        written = [w for s in Env.serials for w in s.written]
+        check("wrong-rate module: unlock+content+rate written",
+              any(b"\xFF\xAA\x69\x88\xB5" in w for w in written)
+              and any(b"\xFF\xAA\x02\x06\x00" in w for w in written)
+              and any(b"\xFF\xAA\x03\x08\x00" in w for w in written))
+        check("wrong-rate module: no baud write",
+              all(b"\xFF\xAA\x04\x06\x00" not in w for w in written))
     finally:
         imu_reader.serial = real_serial
         imu_reader._find_devices = real_find
@@ -504,10 +637,14 @@ def test_full_open_flow():
         check("factory 9600 -> configured and reopened at 115200",
               r.baud == 115200, "baud=%s" % r.baud)
         written = [w for s in EnvC.serials for w in s.written]
-        check("factory path wrote unlock", b"\xFF\xAA\x69\x88\xB5" in written)
-        check("factory path wrote content reg", b"\xFF\xAA\x02\x03\x00" in written)
-        check("factory path wrote rate reg", b"\xFF\xAA\x03\x08\x00" in written)
-        check("factory path wrote baud reg", b"\xFF\xAA\x04\x06\x00" in written)
+        check("factory path wrote unlock",
+              any(b"\xFF\xAA\x69\x88\xB5" in w for w in written))
+        check("factory path wrote content reg",
+              any(b"\xFF\xAA\x02\x06\x00" in w for w in written))
+        check("factory path wrote rate reg",
+              any(b"\xFF\xAA\x03\x08\x00" in w for w in written))
+        check("factory path wrote baud reg",
+              any(b"\xFF\xAA\x04\x06\x00" in w for w in written))
         check("factory path opened 9600 first", any(s.baud == 9600 for s in EnvC.serials))
     finally:
         imu_reader.serial = real_serial
@@ -530,6 +667,56 @@ def test_full_open_flow():
 
 
 # ------------------------------------------------------------- stall guard
+def test_timestamp_reconstruction():
+    """read_sample backdates arrival stamps by the unconsumed backlog so a
+    10-pair burst arriving at one instant gets smooth 20 ms production
+    timestamps (the module flushes in 200 ms bursts on real hardware)."""
+    pairs = []
+    for i in range(10):
+        pairs.append(frame(PKT_ACCEL, 2048 + i, 0, 0))
+        pairs.append(frame(PKT_GYRO, 0, i, 0))
+    r = make_reader([b"".join(pairs)])      # whole burst in ONE chunk
+    real_mono = imu_reader.time.monotonic
+    imu_reader.time.monotonic = lambda: 1000.0
+    try:
+        samples = [r.read_sample() for _ in range(10)]
+    finally:
+        imu_reader.time.monotonic = real_mono
+    ts = [s.t_mono for s in samples]
+    check("burst first sample backdated 180 ms", approx(ts[0], 1000.0 - 0.18),
+          "t0=%.4f" % ts[0])
+    check("burst last sample not backdated", approx(ts[9], 1000.0),
+          "t9=%.4f" % ts[9])
+    ivs = [ts[i] - ts[i - 1] for i in range(1, len(ts))]
+    check("burst timestamps spaced 20 ms",
+          all(approx(x, 0.02) for x in ivs), str(ivs))
+    check("burst timestamps strictly increasing",
+          all(ts[i] > ts[i - 1] for i in range(1, len(ts))))
+
+    # a pair still sitting in the parser buffer is also counted as backlog
+    r2 = make_reader([frame(PKT_ACCEL, 2048, 0, 0) + frame(PKT_GYRO, 0, 0, 0)
+                      + frame(PKT_ACCEL, 2048, 0, 0) + frame(PKT_GYRO, 0, 0, 0)])
+    imu_reader.time.monotonic = lambda: 2000.0
+    try:
+        s = r2.read_sample()       # leaves 22 bytes in _buf -> k = 1
+    finally:
+        imu_reader.time.monotonic = real_mono
+    check("parser-buffer backlog backdated", approx(s.t_mono, 2000.0 - 0.02),
+          "t=%.4f" % s.t_mono)
+
+    # cap: a huge backlog never backdates more than MAX_BACKDATE_PAIRS
+    r3 = make_reader([b"".join(pairs)])
+    r3.ser.in_waiting = 10 * 22
+    imu_reader.time.monotonic = lambda: 3000.0
+    try:
+        s3 = r3.read_sample()
+    finally:
+        imu_reader.time.monotonic = real_mono
+    check("backdate capped at MAX_BACKDATE_PAIRS",
+          approx(s3.t_mono, 3000.0 - imu_reader.MAX_BACKDATE_PAIRS * 0.02),
+          "t=%.4f" % s3.t_mono)
+
+
 def test_no_data_stall_guard():
     r = make_reader([])              # empty stream: never any bytes
     saved = imu_reader.NO_DATA_TIMEOUT_S
@@ -558,7 +745,9 @@ def main():
         test_fifo_count,
         test_open_errors,
         test_probe_and_config_commands,
+        test_open_on_device,
         test_full_open_flow,
+        test_timestamp_reconstruction,
         test_no_data_stall_guard,
     ]
     for t in tests:

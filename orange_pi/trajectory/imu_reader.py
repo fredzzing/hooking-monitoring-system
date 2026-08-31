@@ -29,21 +29,42 @@ Scaling (WitMotion defaults: +-16 g, +-2000 dps, 32768 = full scale):
 Device / baud probing
 ---------------------
 Candidates are /dev/ttyUSB* and /dev/ttyACM* MINUS /dev/ttyACM0 (u-blox GPS,
-never touched). Baud order: 115200 (module already configured) then 9600
-(factory default). A probe = open the port and read for up to 2 s looking for
-a valid 0x55 frame with a good checksum.
+never touched). Baud order: 115200 then 9600 (factory default). A probe =
+open the port and read for up to 2 s looking for a valid 0x55 frame with a
+good checksum.
 
-Factory modules output 10 Hz / full content at 9600 baud. This project needs
-50 Hz and 9600 baud cannot carry 50 Hz x 22 B = 1100 B/s (9600/10 = 960 B/s).
-The module is therefore configured on first contact (registers are stored in
-flash):
+This project needs 50 Hz, and 9600 baud cannot carry 50 Hz x 22 B = 1100 B/s
+(9600/10 = 960 B/s). The output configuration is therefore (re)written on
+EVERY open, at the baud rate the module currently answers on (idempotent):
     unlock           : FF AA 69 88 B5
-    reg 0x02 = 0x03  : output content = accel + gyro only (bandwidth)
+    reg 0x02 = 0x06  : output content = accel + gyro only (bandwidth)
     reg 0x03 = 0x08  : output rate = 50 Hz
-    reg 0x04 = 0x06  : baud rate = 115200
-The baud write takes effect immediately; the port is then reopened at 115200.
-If configuration fails, a warning is printed and the reader continues on the
-baud rate that still produces frames (degraded throughput beats no data).
+    reg 0x04 = 0x06  : baud rate = 115200 -- ONLY on the factory 9600 path
+    save             : FF AA 00 00 00
+A module that already answers at 115200 keeps its baud (no pointless switch):
+measured on-board, the baud can be right while the output rate/content are
+still wrong (200 Hz, 5 packet types 0x50..0x54), so a mere "frames at 115200"
+probe is NOT proof of correct configuration.
+
+HARDWARE QUIRKS (measured on-board, decisive):
+1. The firmware only accepts PROTECTED-register writes (rate 0x03, baud 0x04)
+   when the unlock, the write command and the save arrive as ONE CONTIGUOUS
+   burst in a single serial write(). Separate writes with 10-500 ms gaps are
+   silently REJECTED (the rate register readback never changed, output stayed
+   200 Hz), while unprotected content writes (0x02) applied anyway - which
+   hid the bug. Multi-command bursts proved fragile (byte-sync glitches at
+   115200), so EACH register gets its own unlock+cmd+save burst with a short
+   gap between bursts. Changes then apply IMMEDIATELY (no power cycle).
+2. The module flushes its output in bursts (measured: 10 accel+gyro pairs
+   every 200 ms at 50 Hz). read_sample() therefore reconstructs the
+   PRODUCTION timestamp of each pair by backdating the arrival stamp by the
+   unconsumed backlog (OS buffer + parser buffer) // SAMPLE_BYTES * 20 ms.
+   This yields smooth ~20 ms sample spacing (on-board p95 jitter < 1 ms)
+   instead of the raw 0.06/200 ms arrival bimodality.
+
+After writing, the port is re-probed: frames must still flow. If the module
+goes silent at 115200 after configuration, the reader warns and falls back
+to 9600 (degraded throughput beats no data).
 
 Robustness
 ----------
@@ -93,14 +114,23 @@ READ_CHUNK = 64              # bytes per read() call
 
 # WitMotion configuration commands
 CMD_UNLOCK = b"\xFF\xAA\x69\x88\xB5"
-REG_OUTPUT_CONTENT = 0x02    # 0x03 = accel + gyro only
+CMD_SAVE = b"\xFF\xAA\x00\x00\x00"
+REG_OUTPUT_CONTENT = 0x02    # 0x06 = accel + gyro only
 REG_OUTPUT_RATE = 0x03       # 0x08 = 50 Hz
 REG_BAUD = 0x04              # 0x06 = 115200
-CONFIG_WRITES = (
-    (REG_OUTPUT_CONTENT, 0x03),
+CONFIG_WRITES_CONTENT_RATE = (          # always (re)written on every open
+    (REG_OUTPUT_CONTENT, 0x06),
     (REG_OUTPUT_RATE, 0x08),
+)
+CONFIG_WRITES_BAUD = (                  # factory 9600 path only
     (REG_BAUD, 0x06),
 )
+CONFIG_SLEEP_APPLY = 0.3    # s after config before re-probing
+
+# production-time reconstruction (module flushes in 200 ms bursts)
+NOMINAL_RATE_HZ = 50.0      # configured output rate
+DT_NOMINAL = 1.0 / NOMINAL_RATE_HZ
+MAX_BACKDATE_PAIRS = 10     # cap for the backlog backdating (200 ms)
 
 
 # ---------------------------------------------------------------- helpers
@@ -204,29 +234,19 @@ class IMUReader:
                 "no valid 0x55 frames on %s at %d baud (%.1f s per probe). "
                 "Check the USB connection." % (devices, baud, probe_timeout))
 
-        for dev in devices:                        # auto baud detect
+        for dev in devices:                        # auto baud detect + configure
             try:
-                if self._probe_port(dev, RUN_BAUD, probe_timeout):
-                    self._set_serial(dev, RUN_BAUD)
-                    print("IMU: %s @ %d baud (already configured)"
-                          % (dev, RUN_BAUD), flush=True)
-                    return
-                if self._probe_port(dev, CONFIG_BAUD, probe_timeout):
-                    print("IMU: %s @ %d baud (factory) - configuring "
-                          "accel+gyro 50 Hz @ %d"
-                          % (dev, CONFIG_BAUD, RUN_BAUD), flush=True)
-                    self._set_serial(dev,
-                                     self._configure_device(dev, probe_timeout))
+                if self._open_on_device(dev, probe_timeout):
                     return
             except serial.SerialException as exc:
                 print("WARN: %s open failed: %s" % (dev, exc),
                       file=sys.stderr, flush=True)
                 continue
         raise IMUError(
-            "could not detect WT901SDCL on %s at %s baud: no valid 0x55 "
-            "frames within %.1f s per attempt. Check the USB cable / module "
-            "power, and that the module is not on /dev/ttyACM0 (u-blox GPS)."
-            % (devices, list(BAUD_CANDIDATES), probe_timeout))
+            "could not detect/configure WT901SDCL on %s at %s baud: no valid "
+            "0x55 frames within %.1f s per attempt. Check the USB cable / "
+            "module power, and that the module is not on /dev/ttyACM0 "
+            "(u-blox GPS)." % (devices, list(BAUD_CANDIDATES), probe_timeout))
 
     def _probe_port(self, port, baud, timeout):
         """Open port at baud and read until one valid frame appears (or not).
@@ -259,31 +279,64 @@ class IMUReader:
                 pass
         return False
 
-    def _configure_device(self, port, probe_timeout):
-        """Factory path: unlock + write content/rate/baud registers at 9600,
-        then verify at 115200. Falls back to 9600 (with a warning) if the
-        baud switch did not stick. Raises IMUError if the module stops
-        answering on both rates."""
-        ser = serial.Serial(port, CONFIG_BAUD, timeout=0.2)
+    def _write_config(self, port, baud, include_baud):
+        """Open a temporary serial at `baud` and write the WitMotion config.
+
+        Each register gets its own unlock+write+save CONTIGUOUS burst in a
+        single write() call (hardware quirk: separate writes are silently
+        rejected for protected registers - see module docstring), with a
+        short gap between bursts. The temporary port is closed afterwards;
+        the caller re-probes to verify frames still flow."""
+        cmds = [bytes((0xFF, 0xAA, reg, val, 0x00))
+                for reg, val in CONFIG_WRITES_CONTENT_RATE]
+        if include_baud:
+            cmds += [bytes((0xFF, 0xAA, reg, val, 0x00))
+                     for reg, val in CONFIG_WRITES_BAUD]
+        ser = serial.Serial(port, baud, timeout=0.2)
         try:
             time.sleep(0.2)
-            ser.write(CMD_UNLOCK)
-            time.sleep(0.15)
-            for reg, val in CONFIG_WRITES:
-                ser.write(bytes((0xFF, 0xAA, reg, val, 0x00)))
-                time.sleep(0.15)
+            for cmd in cmds:
+                ser.write(CMD_UNLOCK + cmd + CMD_SAVE)
+                time.sleep(0.25)
+            time.sleep(CONFIG_SLEEP_APPLY)
         finally:
             ser.close()
-        time.sleep(0.3)                # let the module apply the baud switch
-        if self._probe_port(port, RUN_BAUD, probe_timeout):
-            return RUN_BAUD
-        print("WARN: module configured but no frames at %d baud; continuing "
-              "at %d (throughput-limited)" % (RUN_BAUD, CONFIG_BAUD),
-              file=sys.stderr, flush=True)
-        if self._probe_port(port, CONFIG_BAUD, probe_timeout):
-            return CONFIG_BAUD
-        raise IMUError("WT901SDCL stopped answering after configuration on "
-                       "%s (tried %d and %d baud)" % (port, RUN_BAUD, CONFIG_BAUD))
+
+    def _open_on_device(self, dev, probe_timeout):
+        """Bring one device up; returns True once the serial is verified+set.
+
+        A 115200 probe hit is NOT proof of correct configuration (measured
+        on-board: module at 115200 but 200 Hz x 5 packet types), so the
+        content/rate registers are ALWAYS rewritten, at 115200, and frames
+        must keep flowing afterwards. Only a factory 9600 module gets the
+        baud write; it is then re-opened at 115200. If the module goes silent
+        at 115200 after configuration, the 9600 path is tried with a warning.
+        """
+        if self._probe_port(dev, RUN_BAUD, probe_timeout):
+            print("IMU: %s @ %d baud - configuring accel+gyro @ 50 Hz"
+                  % (dev, RUN_BAUD), flush=True)
+            self._write_config(dev, RUN_BAUD, include_baud=False)
+            time.sleep(CONFIG_SLEEP_APPLY)
+            if self._probe_port(dev, RUN_BAUD, probe_timeout):
+                self._set_serial(dev, RUN_BAUD)
+                return True
+            print("WARN: %s silent at %d baud after config; trying %d"
+                  % (dev, RUN_BAUD, CONFIG_BAUD), file=sys.stderr, flush=True)
+        if self._probe_port(dev, CONFIG_BAUD, probe_timeout):
+            print("IMU: %s @ %d baud (factory) - configuring accel+gyro "
+                  "50 Hz @ %d" % (dev, CONFIG_BAUD, RUN_BAUD), flush=True)
+            self._write_config(dev, CONFIG_BAUD, include_baud=True)
+            time.sleep(CONFIG_SLEEP_APPLY)
+            if self._probe_port(dev, RUN_BAUD, probe_timeout):
+                self._set_serial(dev, RUN_BAUD)
+                return True
+            print("WARN: no frames at %d baud after config; continuing at "
+                  "%d (throughput-limited)" % (RUN_BAUD, CONFIG_BAUD),
+                  file=sys.stderr, flush=True)
+            if self._probe_port(dev, CONFIG_BAUD, probe_timeout):
+                self._set_serial(dev, CONFIG_BAUD)
+                return True
+        return False
 
     def _set_serial(self, port, baud):
         self.ser = serial.Serial(port, baud, timeout=0.5)
@@ -339,10 +392,25 @@ class IMUReader:
 
     def _packets_to_sample(self, accel_pkt, gyro_pkt):
         """Convert a matched 0x51/0x52 packet pair to a raw IMUSample
-        (raw = no bias correction). t_mono = arrival of the later packet."""
+        (raw = no bias correction).
+
+        Timestamp = reconstructed PRODUCTION time: the module flushes its
+        50 Hz output in bursts (measured: 10 pairs per 200 ms), so the raw
+        arrival stamp is backdated by the unconsumed backlog (OS input
+        buffer + parser buffer) // SAMPLE_BYTES * DT_NOMINAL. This yields
+        smooth ~20 ms sample spacing (on-board: p95 jitter < 1 ms) instead
+        of the raw 0.06 ms / 200 ms arrival bimodality."""
         _, ax_r, ay_r, az_r, _, t_a = accel_pkt
         _, gx_r, gy_r, gz_r, _, t_g = gyro_pkt
-        t = t_g if t_g >= t_a else t_a
+        t_arr = t_g if t_g >= t_a else t_a
+        try:
+            backlog = self.ser.in_waiting + len(self._buf)
+        except Exception:                # noqa: BLE001
+            backlog = len(self._buf)
+        k = backlog // SAMPLE_BYTES
+        if k > MAX_BACKDATE_PAIRS:
+            k = MAX_BACKDATE_PAIRS
+        t = t_arr - k * DT_NOMINAL
         sat_flag = 0
         if (abs(ax_r) >= SAT_LSB or abs(ay_r) >= SAT_LSB or abs(az_r) >= SAT_LSB
                 or abs(gx_r) >= SAT_LSB or abs(gy_r) >= SAT_LSB
