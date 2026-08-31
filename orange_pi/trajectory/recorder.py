@@ -30,15 +30,19 @@ updates then get rejected by the chi-square gate). Pre-aligned, the
 stationary a_nav error is ~0.02 m/s^2 from the first sample.
 
 Timestamp reconstruction (IMPORTANT): read-time stamps are polluted by
-intermittent i2c stalls (measured on-board: fifo_count / read transactions
+intermittent serial-read stalls (measured on-board: UART read transactions
 occasionally take 20-43 ms instead of ~1-3 ms when the GPS USB-serial reader
-runs concurrently; the MPU keeps producing into its FIFO during the stall,
-so no sample is lost). Instead of writing late read-times, the recorder
-backdates each sample by the FIFO backlog: t_out = t_raw - k*dt_ema, where
-k = (remaining FIFO bytes after the read) // SAMPLE_BYTES and dt_ema is the
+runs concurrently; the module keeps producing into the kernel input buffer
+during the stall, so no sample is lost). Instead of writing late read-times,
+the recorder backdates each sample by the serial-buffer backlog:
+t_out = t_raw - k*dt_ema, where
+k = (bytes remaining in the serial input buffer after the read) //
+    SAMPLE_BYTES and dt_ema is the
 measured production interval (initialized from the 10 s calibration sample
 count, then refined online as the median of recent raw inter-read intervals,
-robust to the i2c stalls). This reconstructs
+robust to the serial-read stalls). The WitMotion WT901SDCL has no FIFO:
+_fifo_count() returns the serial input buffer backlog in bytes
+(ser.in_waiting). This reconstructs
 the sensor's true production timeline (error ~ms) and keeps dt monotonic
 and gap-free. Backdated sample count and max backdate are recorded in
 .meta.json ("backdated"); nothing is dropped and no dt is hardcoded.
@@ -130,7 +134,7 @@ HOLD_SPD_WINDOW = 5   # fixes: speed median window for the hold speed gate
 HOLD_SPD_MIN_FIXES = 3  # fixes: fall back to the instantaneous speed below this
 RATE_FLOOR = 40.0        # Hz: sample-rate guard threshold
 RATE_GUARD_WINDOW = 5.0  # s: sustained window for the guard
-MAX_BACKLOG = 10         # max FIFO backlog (samples) honoured for backdating
+MAX_BACKLOG = 10         # max serial-buffer backlog (samples) honoured for backdating
 EXPECTED_COLS = 28
 
 HEADER = [
@@ -144,11 +148,13 @@ HEADER = [
     "zupt",
 ]
 
-# Board IMU config as deployed/verified in Task 2 (FS_SEL=1 -> 500 dps,
-# AFS_SEL=1 -> 4g, DLPF_CFG=4, i2c-2 @ 0x68). See imu_reader.py.
+# Board IMU config: WitMotion WT901SDCL over UART (replaces the MPU6050
+# on i2c-2 @ 0x68). See imu_reader.py.
 IMU_CONFIG = {
-    "accel_range": "4g", "gyro_range": "500dps", "dlpf_cfg": 4,
-    "i2c_bus": 2, "i2c_addr": 104,
+    "model": "WitMotion WT901SDCL",
+    "interface": "uart",
+    "accel_range": "16g", "gyro_range": "2000dps",
+    "output_rate_hz": 50,
 }
 
 
@@ -312,10 +318,11 @@ def gps_thread(gps, q, stop):
 
 
 def imu_thread(imu, q, stop, dt_ema):
-    """Read IMU samples; annotate each with the FIFO backlog (samples left
-    after the read) so the fusion thread can backdate late stamps. dt_ema
-    is a robust MEDIAN of recent raw inter-read intervals (immune to the
-    intermittent slow-i2c stalls and catch-up bursts)."""
+    """Read IMU samples; annotate each with the serial-buffer backlog
+    (bytes left after the read, converted to samples) so the fusion thread
+    can backdate late stamps. dt_ema is a robust MEDIAN of recent raw
+    inter-read intervals (immune to the intermittent serial-read stalls
+    and catch-up bursts)."""
     prev_raw = None
     win = collections.deque(maxlen=256)
     while not stop.is_set():
@@ -347,8 +354,9 @@ def process_sample(item, ctx):
     """Fuse one IMU sample and emit one CSV row.
 
     item = (IMUSample, backlog_k). The stamp is backdated by
-    k * dt_ema (FIFO-depth timestamp reconstruction, see module docstring);
-    dt is the MEASURED production interval, never a hardcoded 0.02 s."""
+    k * dt_ema (serial-buffer-backlog timestamp reconstruction, see module
+    docstring); dt is the MEASURED production interval, never a hardcoded
+    0.02 s."""
     s, k = item
     dte = ctx.dt_ema[0]                  # measured production interval
     t_raw = s.t_mono
@@ -575,7 +583,7 @@ def main(argv=None):
         gps_thr.start()
 
         # 2) IMU open + 10 s static calibration (GPS fixes collected meanwhile)
-        print("opening IMU (i2c-2 @0x68) ...", flush=True)
+        print("opening IMU (WitMotion WT901SDCL serial) ...", flush=True)
         imu = imu_reader.IMUReader()
         print("calibrating IMU (10 s, KEEP STATIC) ...", flush=True)
         cal = imu.calibrate(10.0)
@@ -593,12 +601,13 @@ def main(argv=None):
         dt_ema = [min(max(dt0, 0.015), 0.030)]
 
         # Start the IMU thread NOW, before the first-fix wait / survey-in.
-        # The MPU6050 clone's 1024-byte FIFO overflows after ~1.7 s without
-        # reads and, on overflow, its read stream shifts 8 bytes off packet
-        # boundary (reproduced on-board: channels permute to gy/gz/ax/ay/az/gx,
-        # a_mag 10.0 -> 5.2) -> every subsequent sample is garbage. The thread
-        # keeps draining the FIFO through the idle survey window; its queue
-        # is discarded and drop counters are reset before recording starts.
+        # The WitMotion WT901SDCL streams over USB serial: its kernel input
+        # buffer (~4 KB) also backs up while nothing reads, but no sample is
+        # lost (the kernel buffer is large and the read thread drains it
+        # continuously). The thread keeps draining the serial buffer through
+        # the idle survey window (preventing buffer backlog from delaying
+        # read timestamps); its queue is discarded and drop counters are
+        # reset before recording starts.
         imu_thr = threading.Thread(target=imu_thread,
                                    args=(imu, imu_q, stop, dt_ema),
                                    daemon=True, name="imu")
@@ -613,7 +622,7 @@ def main(argv=None):
                and not stop.is_set()):
             for fix in gps_q.drain():
                 first_fix = fix
-            imu_q.drain()      # keep the FIFO flowing (discarded)
+            imu_q.drain()      # keep the serial buffer drained (discarded)
             if first_fix is not None:
                 break
             time.sleep(0.05)
@@ -638,7 +647,7 @@ def main(argv=None):
         while not stop.is_set():
             for fix in gps_q.drain():
                 survey_fixes.append(fix)
-            imu_q.drain()      # keep the FIFO flowing (discarded)
+            imu_q.drain()      # keep the serial buffer drained (discarded)
             elapsed = time.monotonic() - t_survey
             if elapsed >= SURVEY_IN_SECONDS \
                     and len(survey_fixes) >= SURVEY_IN_MIN_FIXES:

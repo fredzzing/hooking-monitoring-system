@@ -1,6 +1,6 @@
 # 吊钩轨迹物理测试脚本（TEST-PROCEDURE）
 
-> 适用：Orange Pi 3B + u-blox GPS（1Hz）+ MPU6050（50Hz）融合系统
+> 适用：Orange Pi 3B + u-blox GPS（1Hz）+ WitMotion WT901SDCL（50Hz）融合系统
 > 部署目录：`/root/trajectory`（recorder.py / analyze.py / validate_csv.py）
 > **所有判定均为脚本化断言（退出码 0=PASS、1=FAIL、2=用法/IO 错误），不做目测。**
 
@@ -102,7 +102,7 @@ python3 analyze.py $CSV --metric attitude_static ; echo "ATT_EXIT=$?"
 - static_drift：水平漂移 < 5 m、垂直 < 8 m、末速 < 0.1 m/s
 - attitude_static：静止段 mean|roll|、mean|pitch| < 1°（相对安装姿态）
 
-任一 FAIL → 系统异常（参考 learnings：GPS 多径 / FIFO 溢出 / 姿态收敛），
+任一 FAIL → 系统异常（参考 learnings：GPS 多径 / 串口读取异常 / 姿态收敛），
 排除后重测。
 
 ---

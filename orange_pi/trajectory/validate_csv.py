@@ -37,8 +37,8 @@ Sibling metadata file (.meta.json, same stem as CSV, written by recorder.py):
   "mount_gravity": {"x": float, "y": float, "z": float},          # measured gravity in body frame (m/s^2)
   "sample_rate":   50.0,
   "duration":      1800.0,                                        # planned seconds
-  "imu":           {"accel_range": "4g", "gyro_range": "500dps", "dlpf_cfg": 4,
-                    "i2c_bus": 2, "i2c_addr": 104},
+  "imu":           {"model": "WitMotion WT901SDCL", "interface": "uart",
+                    "accel_range": "16g", "gyro_range": "2000dps", "output_rate_hz": 50},
   "gps":           {"port": "/dev/ttyACM0", "baud": 115200, "fix_min": 1, "hdop_max": 2.0},
   "start_time":    "2026-08-24T12:00:00.000+08:00"
 }

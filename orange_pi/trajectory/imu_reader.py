@@ -1,82 +1,141 @@
 #!/usr/bin/env python3
-"""imu_reader.py -- MPU6050 50 Hz FIFO reader for the GPS+IMU hook-trajectory project.
+"""imu_reader.py -- WitMotion WT901SDCL 50 Hz serial reader for the GPS+IMU
+hook-trajectory project.
 
-Board: Orange Pi 3B, MPU6050 on i2c-2 @ 0x68 (400 kHz).
-Timing comes from the MPU6050 internal sample clock delivered through the FIFO,
-never from a fixed assumed dt.
+Sensor replacement: the MPU6050 (smbus2, i2c-2 @ 0x68, FIFO) is replaced by a
+WitMotion WT901SDCL smart IMU on a USB-serial port (pyserial). The public
+interface is unchanged, so recorder.py keeps working untouched:
 
-Register configuration
-----------------------
-PWR_MGMT_1 (0x6B) = 0x00          wake up
-SMPLRT_DIV (0x19) = 19            1000 Hz / (1 + 19) = 50 Hz sample rate
-CONFIG     (0x1A) = 0x04          DLPF_CFG=4 -> accel ~21 Hz, gyro ~20 Hz BW (anti-alias)
-GYRO_CONFIG(0x1B) = 0x08          FS_SEL=1 -> +-500 dps, 65.5 LSB/(deg/s)
-ACCEL_CONFIG(0x1C)= 0x08          AFS_SEL=1 -> +-4 g, 8192 LSB/g
-FIFO_EN    (0x23) = 0x78          accel + gyro FIFO enabled
-USER_CTRL  (0x6A) = 0x40          FIFO enable bit
+    IMUSample dataclass : t_mono, ax, ay, az (m/s^2), gx, gy, gz (rad/s), sat_flag
+    IMUReader()         : auto-detect device + baud rate, configure, open
+    read_sample()       : block for the next accel+gyro pair, bias-corrected
+    calibrate(10.0)     : static calibration -> {gyro_bias, accel_bias,
+                          mount_gravity, n_samples, duration_s}
+    _fifo_count()       : serial RX backlog in bytes (recorder backdates
+                          sample stamps with rem // SAMPLE_BYTES; serial
+                          in_waiting keeps that byte-based contract)
+    SAMPLE_BYTES = 22   : one sample = accel frame (11 B) + gyro frame (11 B)
 
-NOTE: the plan text mentions "GYRO_CONFIG/ACCEL_CONFIG = 0x10" and
-"FIFO_EN @ 0x3A". 0x10 on those registers is FS_SEL=2/AFS_SEL=2 (+-1000 dps /
-+-8 g) which contradicts the mandated FS_SEL=1/AFS_SEL=1 ranges and scaling
-(65.5 LSB/dps, 8192 LSB/g); 0x3A is INT_STATUS, not FIFO_EN. This module uses
-the register values that implement the required ranges: 0x08/0x08 and 0x23.
+WitMotion frame (11 bytes):
+    0x55 | TYPE | D0L D0H D1L D1H D2L D2H D3L D3H | SUM
+    SUM  = (sum of the first 10 bytes) & 0xFF
+    0x51 = acceleration frame (D0..D2 = ax, ay, az, int16 little-endian)
+    0x52 = angular-rate frame (D0..D2 = wx, wy, wz, int16 little-endian)
 
-Scaling
--------
-accel [m/s^2] = raw / 8192 * 9.80665
-gyro  [rad/s] = raw / 65.5 * pi / 180
+Scaling (WitMotion defaults: +-16 g, +-2000 dps, 32768 = full scale):
+    accel [m/s^2] = raw / 32768 * 16 * 9.80665
+    gyro  [rad/s] = raw / 32768 * 2000 * pi / 180
 
-FIFO packet: this MPU6050 (clone) omits TEMP from the FIFO when
-FIFO_EN bit 7 (TEMP_FIFO_EN) = 0, so a sample packet is 12 bytes =
-6 accel + 6 gyro (no temp), read from 0x74. Empirically verified:
-a 14-byte read drifts 2 bytes per packet and was rejected.
+Device / baud probing
+---------------------
+Candidates are /dev/ttyUSB* and /dev/ttyACM* MINUS /dev/ttyACM0 (u-blox GPS,
+never touched). Baud order: 115200 (module already configured) then 9600
+(factory default). A probe = open the port and read for up to 2 s looking for
+a valid 0x55 frame with a good checksum.
+
+Factory modules output 10 Hz / full content at 9600 baud. This project needs
+50 Hz and 9600 baud cannot carry 50 Hz x 22 B = 1100 B/s (9600/10 = 960 B/s).
+The module is therefore configured on first contact (registers are stored in
+flash):
+    unlock           : FF AA 69 88 B5
+    reg 0x02 = 0x03  : output content = accel + gyro only (bandwidth)
+    reg 0x03 = 0x08  : output rate = 50 Hz
+    reg 0x04 = 0x06  : baud rate = 115200
+The baud write takes effect immediately; the port is then reopened at 115200.
+If configuration fails, a warning is printed and the reader continues on the
+baud rate that still produces frames (degraded throughput beats no data).
+
+Robustness
+----------
+read_sample() re-synchronises byte-by-byte: garbage bytes, dropped frames,
+misaligned reads and checksum errors are skipped without crashing. The
+timestamp is time.monotonic() at the arrival of the LATER of the two frames
+of a pair. A no-data stall guard raises IMUError after NO_DATA_TIMEOUT_S s
+so the recorder's IMU thread logs the fault instead of silently spinning.
 """
 
+import glob
 import math
+import sys
 import time
 from dataclasses import dataclass
 
-import smbus2
+try:
+    import serial
+except ImportError:            # pragma: no cover - board has pyserial 3.5
+    serial = None
 
 # ---------------------------------------------------------------- constants
-I2C_BUS = 2
-DEV_ADDR = 0x68
-
-REG_PWR_MGMT_1 = 0x6B
-REG_SMPLRT_DIV = 0x19
-REG_CONFIG = 0x1A
-REG_GYRO_CONFIG = 0x1B
-REG_ACCEL_CONFIG = 0x1C
-REG_FIFO_EN = 0x23          # MPU6050 FIFO_EN (plan doc wrote 0x3A = INT_STATUS)
-REG_USER_CTRL = 0x6A
-REG_FIFO_COUNT_H = 0x72
-REG_FIFO_COUNT_L = 0x73
-REG_FIFO_R_W = 0x74
-
-SMPLRT_DIV_VAL = 19         # 1 kHz / (1 + 19) = 50 Hz
-DLPF_CFG_VAL = 4            # accel ~21 Hz, gyro ~20 Hz anti-alias bandwidth
-GYRO_FS_SEL_VAL = 1         # +-500 dps
-ACCEL_AFS_SEL_VAL = 1       # +-4 g
-FIFO_EN_ACCEL_GYRO = 0x78   # bits 6..3: XG/YG/ZG/ACCEL FIFO enable
-USER_CTRL_FIFO_EN = 0x40    # bit 6 FIFO enable
+PKT_ACCEL = 0x51
+PKT_GYRO = 0x52
+FRAME_LEN = 11
+SAMPLE_BYTES = 22            # accel frame (11) + gyro frame (11)
 
 G = 9.80665
-ACCEL_LSB_PER_G = 8192.0
-GYRO_LSB_PER_DPS = 65.5
 DEG2RAD = math.pi / 180.0
 
-SAMPLE_BYTES = 12           # this clone: accel(6) + gyro(6); temp omitted when TEMP_FIFO_EN=0
-FIFO_OVERFLOW_THRESH = 1024
+ACCEL_FS_G = 16.0            # +-16 g full scale
+GYRO_FS_DPS = 2000.0         # +-2000 dps full scale
+RAW_FULL_SCALE = 32768.0     # int16 full-scale count
+ACCEL_RAW_TO_MS2 = ACCEL_FS_G * G / RAW_FULL_SCALE
+GYRO_RAW_TO_RADS = GYRO_FS_DPS * DEG2RAD / RAW_FULL_SCALE
+SAT_LSB = int(0.98 * RAW_FULL_SCALE)   # 32112: |raw| >= this -> sat_flag = 1
 
-# saturation thresholds: |raw| >= 0.98 * full-scale count
-ACCEL_SAT_LSB = int(0.98 * ACCEL_LSB_PER_G * 4)      # 32112
-GYRO_SAT_LSB = int(0.98 * GYRO_LSB_PER_DPS * 500)    # 32095
+# device probing: /dev/ttyUSB* first, then /dev/ttyACM*; ttyACM0 = u-blox GPS
+DEVICE_GLOBS = ("/dev/ttyUSB*", "/dev/ttyACM*")
+EXCLUDED_DEVICES = ("/dev/ttyACM0",)
+BAUD_CANDIDATES = (115200, 9600)
+CONFIG_BAUD = 9600
+RUN_BAUD = 115200
+PROBE_TIMEOUT = 2.0          # s of reading per (device, baud) probe attempt
+NO_DATA_TIMEOUT_S = 5.0      # s without any serial bytes -> IMUError
+READ_CHUNK = 64              # bytes per read() call
+
+# WitMotion configuration commands
+CMD_UNLOCK = b"\xFF\xAA\x69\x88\xB5"
+REG_OUTPUT_CONTENT = 0x02    # 0x03 = accel + gyro only
+REG_OUTPUT_RATE = 0x03       # 0x08 = 50 Hz
+REG_BAUD = 0x04              # 0x06 = 115200
+CONFIG_WRITES = (
+    (REG_OUTPUT_CONTENT, 0x03),
+    (REG_OUTPUT_RATE, 0x08),
+    (REG_BAUD, 0x06),
+)
 
 
 # ---------------------------------------------------------------- helpers
-def _i16(hi, lo):
-    v = (hi << 8) | lo
+def _i16(lo, hi):
+    """Decode int16 little-endian (WitMotion DxL DxH byte order)."""
+    v = lo | (hi << 8)
     return v - 65536 if v >= 32768 else v
+
+
+def _extract_frame(buf):
+    """Scan buf for the next valid 11-byte frame.
+
+    Consumes buf up to and including a valid frame; returns
+    (ptype, d0, d1, d2, d3) or None. Garbage, noise and checksum errors are
+    skipped one byte at a time (re-sync on the next 0x55).
+    """
+    while len(buf) >= FRAME_LEN:
+        idx = buf.find(0x55)
+        if idx < 0:
+            del buf[:max(0, len(buf) - (FRAME_LEN - 1))]   # keep tail: a
+            return None                                    # header may straddle
+        if idx > 0:
+            del buf[:idx]
+            continue
+        ptype = buf[1]
+        if (ptype in (PKT_ACCEL, PKT_GYRO)
+                and (sum(buf[0:10]) & 0xFF) == buf[10]):
+            d0 = _i16(buf[2], buf[3])
+            d1 = _i16(buf[4], buf[5])
+            d2 = _i16(buf[6], buf[7])
+            d3 = _i16(buf[8], buf[9])
+            del buf[:FRAME_LEN]
+            return (ptype, d0, d1, d2, d3)
+        del buf[0]             # bad checksum / unknown type: re-sync
+    return None
 
 
 @dataclass
@@ -96,79 +155,225 @@ class IMUSample:
     sat_flag: int
 
 
+class IMUError(RuntimeError):
+    """Fatal IMU hardware/configuration error (readable message)."""
+
+
+def _find_devices():
+    """Existing /dev/ttyUSB* + /dev/ttyACM* devices, excluding the GPS."""
+    found = []
+    for pattern in DEVICE_GLOBS:
+        found.extend(glob.glob(pattern))
+    found = sorted(set(found),
+                   key=lambda d: (not d.startswith("/dev/ttyUSB"), d))
+    return [d for d in found if d not in EXCLUDED_DEVICES]
+
+
 class IMUReader:
-    """Configure MPU6050 and read 50 Hz samples from its FIFO."""
+    """Open/configure the WitMotion WT901SDCL and read 50 Hz accel+gyro pairs."""
 
-    def __init__(self, bus=I2C_BUS, addr=DEV_ADDR):
-        self.bus = smbus2.SMBus(bus)
-        self.addr = addr
-        self.cal = None          # Calibration dict, set by calibrate()
-        self._configure()
-        self._reset_fifo()
+    def __init__(self, port=None, baud=None, probe_timeout=PROBE_TIMEOUT):
+        self.ser = None
+        self._buf = bytearray()
+        self.cal = None              # Calibration dict, set by calibrate()
+        self.port = None
+        self.baud = None
+        self._open(port=port, baud=baud, probe_timeout=probe_timeout)
 
-    # ------------------------------------------------------------ config
-    def _configure(self):
-        b = self.bus
-        b.write_byte_data(self.addr, REG_PWR_MGMT_1, 0x00)        # wake
-        time.sleep(0.10)
-        b.write_byte_data(self.addr, REG_SMPLRT_DIV, SMPLRT_DIV_VAL)
-        b.write_byte_data(self.addr, REG_CONFIG, DLPF_CFG_VAL)
-        b.write_byte_data(self.addr, REG_GYRO_CONFIG, GYRO_FS_SEL_VAL << 3)
-        b.write_byte_data(self.addr, REG_ACCEL_CONFIG, ACCEL_AFS_SEL_VAL << 3)
-        b.write_byte_data(self.addr, REG_FIFO_EN, FIFO_EN_ACCEL_GYRO)
-        b.write_byte_data(self.addr, REG_USER_CTRL, USER_CTRL_FIFO_EN)
-        time.sleep(0.05)
+    # ------------------------------------------------------------ open
+    def _open(self, port=None, baud=None, probe_timeout=PROBE_TIMEOUT):
+        if serial is None:
+            raise IMUError("pyserial is not installed (pip install pyserial)")
+        devices = [port] if port is not None else _find_devices()
+        if not devices:
+            raise IMUError(
+                "no candidate WitMotion serial device found (searched %s; "
+                "/dev/ttyACM0 excluded = u-blox GPS). Check the WT901SDCL "
+                "USB cable / power." % ", ".join(DEVICE_GLOBS))
 
-    def _reset_fifo(self):
-        b = self.bus
-        b.write_byte_data(self.addr, REG_USER_CTRL, 0x44)   # FIFO_EN | FIFO_RST
-        b.write_byte_data(self.addr, REG_USER_CTRL, 0x40)   # re-enable
-        time.sleep(0.01)
+        if baud is not None:                       # fixed baud: verify only
+            for dev in devices:
+                try:
+                    if self._probe_port(dev, baud, probe_timeout):
+                        self._set_serial(dev, baud)
+                        return
+                except serial.SerialException as exc:
+                    print("WARN: %s open failed: %s" % (dev, exc),
+                          file=sys.stderr, flush=True)
+            raise IMUError(
+                "no valid 0x55 frames on %s at %d baud (%.1f s per probe). "
+                "Check the USB connection." % (devices, baud, probe_timeout))
 
-    def _fifo_count(self):
-        hi = self.bus.read_byte_data(self.addr, REG_FIFO_COUNT_H)
-        lo = self.bus.read_byte_data(self.addr, REG_FIFO_COUNT_L)
-        return (hi << 8) | lo
+        for dev in devices:                        # auto baud detect
+            try:
+                if self._probe_port(dev, RUN_BAUD, probe_timeout):
+                    self._set_serial(dev, RUN_BAUD)
+                    print("IMU: %s @ %d baud (already configured)"
+                          % (dev, RUN_BAUD), flush=True)
+                    return
+                if self._probe_port(dev, CONFIG_BAUD, probe_timeout):
+                    print("IMU: %s @ %d baud (factory) - configuring "
+                          "accel+gyro 50 Hz @ %d"
+                          % (dev, CONFIG_BAUD, RUN_BAUD), flush=True)
+                    self._set_serial(dev,
+                                     self._configure_device(dev, probe_timeout))
+                    return
+            except serial.SerialException as exc:
+                print("WARN: %s open failed: %s" % (dev, exc),
+                      file=sys.stderr, flush=True)
+                continue
+        raise IMUError(
+            "could not detect WT901SDCL on %s at %s baud: no valid 0x55 "
+            "frames within %.1f s per attempt. Check the USB cable / module "
+            "power, and that the module is not on /dev/ttyACM0 (u-blox GPS)."
+            % (devices, list(BAUD_CANDIDATES), probe_timeout))
+
+    def _probe_port(self, port, baud, timeout):
+        """Open port at baud and read until one valid frame appears (or not).
+
+        Returns True if a checksum-valid 0x51/0x52 frame was received within
+        `timeout` seconds. Never raises for a missing/non-IMU device.
+        """
+        try:
+            ser = serial.Serial(port, baud, timeout=0.2)
+        except serial.SerialException:
+            return False
+        buf = bytearray()
+        t_end = time.monotonic() + timeout
+        try:
+            while time.monotonic() < t_end:
+                try:
+                    chunk = ser.read(READ_CHUNK)
+                except serial.SerialException:
+                    break
+                if not chunk:
+                    time.sleep(0.005)
+                    continue
+                buf.extend(chunk)
+                if _extract_frame(buf) is not None:
+                    return True
+        finally:
+            try:
+                ser.close()
+            except Exception:        # noqa: BLE001 - best effort
+                pass
+        return False
+
+    def _configure_device(self, port, probe_timeout):
+        """Factory path: unlock + write content/rate/baud registers at 9600,
+        then verify at 115200. Falls back to 9600 (with a warning) if the
+        baud switch did not stick. Raises IMUError if the module stops
+        answering on both rates."""
+        ser = serial.Serial(port, CONFIG_BAUD, timeout=0.2)
+        try:
+            time.sleep(0.2)
+            ser.write(CMD_UNLOCK)
+            time.sleep(0.15)
+            for reg, val in CONFIG_WRITES:
+                ser.write(bytes((0xFF, 0xAA, reg, val, 0x00)))
+                time.sleep(0.15)
+        finally:
+            ser.close()
+        time.sleep(0.3)                # let the module apply the baud switch
+        if self._probe_port(port, RUN_BAUD, probe_timeout):
+            return RUN_BAUD
+        print("WARN: module configured but no frames at %d baud; continuing "
+              "at %d (throughput-limited)" % (RUN_BAUD, CONFIG_BAUD),
+              file=sys.stderr, flush=True)
+        if self._probe_port(port, CONFIG_BAUD, probe_timeout):
+            return CONFIG_BAUD
+        raise IMUError("WT901SDCL stopped answering after configuration on "
+                       "%s (tried %d and %d baud)" % (port, RUN_BAUD, CONFIG_BAUD))
+
+    def _set_serial(self, port, baud):
+        self.ser = serial.Serial(port, baud, timeout=0.5)
+        self.port = port
+        self.baud = baud
+        self._buf = bytearray()
+        print("IMU: opened %s @ %d baud (pyserial)" % (port, baud), flush=True)
+
+    def close(self):
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:        # noqa: BLE001
+                pass
+            self.ser = None
 
     # ------------------------------------------------------------ sample
-    def _read_raw_sample(self):
-        """Read one FIFO sample WITHOUT bias correction."""
+    def _fifo_count(self):
+        """Bytes backlogged in the serial RX buffer (recorder backdates late
+        sample stamps by rem // SAMPLE_BYTES; serial in_waiting keeps the
+        byte-based contract of the old MPU FIFO depth)."""
+        try:
+            return self.ser.in_waiting
+        except Exception:            # noqa: BLE001
+            return 0
+
+    def _read_next_packet(self):
+        """Block until one valid frame; return (ptype, d0, d1, d2, d3, t_mono).
+
+        Raises IMUError when no bytes at all arrive for NO_DATA_TIMEOUT_S s
+        (cable pulled / module dead) so the caller can log instead of
+        spinning forever."""
+        last_byte = time.monotonic()
         while True:
-            n = self._fifo_count()
-            if n >= SAMPLE_BYTES:
-                break
-            if n >= FIFO_OVERFLOW_THRESH:      # overflow guard
-                self._reset_fifo()
-            time.sleep(0.0005)
+            while len(self._buf) < FRAME_LEN:
+                try:
+                    chunk = self.ser.read(READ_CHUNK)
+                except serial.SerialException:
+                    chunk = b""
+                if chunk:
+                    last_byte = time.monotonic()
+                    self._buf.extend(chunk)
+                else:
+                    if time.monotonic() - last_byte > NO_DATA_TIMEOUT_S:
+                        raise IMUError(
+                            "no data from WT901SDCL on %s for %.1f s - check "
+                            "the USB cable / module power"
+                            % (self.port, NO_DATA_TIMEOUT_S))
+                    time.sleep(0.001)
+            pkt = _extract_frame(self._buf)
+            if pkt is not None:
+                return pkt + (time.monotonic(),)
 
-        data = self.bus.read_i2c_block_data(self.addr, REG_FIFO_R_W, SAMPLE_BYTES)
-        t = time.monotonic()
-
-        ax_raw = _i16(data[0], data[1])
-        ay_raw = _i16(data[2], data[3])
-        az_raw = _i16(data[4], data[5])
-        gx_raw = _i16(data[6], data[7])
-        gy_raw = _i16(data[8], data[9])
-        gz_raw = _i16(data[10], data[11])
-
+    def _packets_to_sample(self, accel_pkt, gyro_pkt):
+        """Convert a matched 0x51/0x52 packet pair to a raw IMUSample
+        (raw = no bias correction). t_mono = arrival of the later packet."""
+        _, ax_r, ay_r, az_r, _, t_a = accel_pkt
+        _, gx_r, gy_r, gz_r, _, t_g = gyro_pkt
+        t = t_g if t_g >= t_a else t_a
         sat_flag = 0
-        if (abs(ax_raw) >= ACCEL_SAT_LSB or abs(ay_raw) >= ACCEL_SAT_LSB
-                or abs(az_raw) >= ACCEL_SAT_LSB or abs(gx_raw) >= GYRO_SAT_LSB
-                or abs(gy_raw) >= GYRO_SAT_LSB or abs(gz_raw) >= GYRO_SAT_LSB):
+        if (abs(ax_r) >= SAT_LSB or abs(ay_r) >= SAT_LSB or abs(az_r) >= SAT_LSB
+                or abs(gx_r) >= SAT_LSB or abs(gy_r) >= SAT_LSB
+                or abs(gz_r) >= SAT_LSB):
             sat_flag = 1
+        return IMUSample(t_mono=t,
+                         ax=ax_r * ACCEL_RAW_TO_MS2,
+                         ay=ay_r * ACCEL_RAW_TO_MS2,
+                         az=az_r * ACCEL_RAW_TO_MS2,
+                         gx=gx_r * GYRO_RAW_TO_RADS,
+                         gy=gy_r * GYRO_RAW_TO_RADS,
+                         gz=gz_r * GYRO_RAW_TO_RADS,
+                         sat_flag=sat_flag)
 
-        ax = ax_raw / ACCEL_LSB_PER_G * G
-        ay = ay_raw / ACCEL_LSB_PER_G * G
-        az = az_raw / ACCEL_LSB_PER_G * G
-        gx = gx_raw / GYRO_LSB_PER_DPS * DEG2RAD
-        gy = gy_raw / GYRO_LSB_PER_DPS * DEG2RAD
-        gz = gz_raw / GYRO_LSB_PER_DPS * DEG2RAD
-
-        return IMUSample(t_mono=t, ax=ax, ay=ay, az=az,
-                         gx=gx, gy=gy, gz=gz, sat_flag=sat_flag)
+    def _read_raw_sample(self):
+        """Block for one accel+gyro pair of the SAME output cycle; raw."""
+        accel = None
+        while True:
+            pkt = self._read_next_packet()
+            if pkt[0] == PKT_ACCEL:
+                accel = pkt
+                while True:                    # wait for this accel's gyro
+                    pkt2 = self._read_next_packet()
+                    if pkt2[0] == PKT_GYRO:
+                        return self._packets_to_sample(accel, pkt2)
+                    if pkt2[0] == PKT_ACCEL:
+                        accel = pkt2           # newer accel: keep waiting
+            # a gyro before any accel is the stale tail of a lost cycle: skip
 
     def read_sample(self):
-        """Block until the next FIFO sample is available; return it
+        """Block until the next accel+gyro pair is available; return it
         bias-corrected (after calibrate() has run)."""
         s = self._read_raw_sample()
         if self.cal is not None:               # apply startup calibration
@@ -182,7 +387,7 @@ class IMUReader:
 
     # ---------------------------------------------------------- calibrate
     def calibrate(self, duration=10.0):
-        """Static-startup calibration.
+        """Static-startup calibration (module configuration NOT modified).
 
         Requires the IMU to be stationary for `duration` seconds.
         Returns (and stores) a Calibration dict with keys:
@@ -190,7 +395,11 @@ class IMUReader:
             accel_bias    : [m/s^2, ...]  mean accel minus gravity component
             mount_gravity : unit vector of gravity in the body frame
         """
-        self._reset_fifo()
+        try:
+            self.ser.reset_input_buffer()      # start from a clean stream
+        except Exception:                      # noqa: BLE001
+            pass
+        self._buf = bytearray()
         n = 0
         s_ax = s_ay = s_az = s_gx = s_gy = s_gz = 0.0
         t_end = time.monotonic() + duration
@@ -224,4 +433,8 @@ class IMUReader:
 
 if __name__ == "__main__":
     r = IMUReader()
-    print(r.calibrate(10))
+    try:
+        print("device=%s baud=%d" % (r.port, r.baud))
+        print(r.calibrate(10.0))
+    finally:
+        r.close()

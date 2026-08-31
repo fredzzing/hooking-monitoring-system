@@ -1,6 +1,6 @@
 # 吊钩轨迹记录系统使用说明（GPS + IMU 融合）
 
-> 平台：Orange Pi 3B（aarch64）+ u-blox GPS（1 Hz）+ MPU6050（50 Hz）
+> 平台：Orange Pi 3B（aarch64）+ u-blox GPS（1 Hz）+ WitMotion WT901SDCL（USB 串口，50 Hz）
 > 目录：`/root/trajectory`（所有模块、脚本、测试数据）
 > 坐标系：ENU（东北上），原点为录制开始时 GPS survey-in 中位数（见 meta.json 的 origin）
 > 本说明所有参数均来自实机实测（2026-08-24），不夸大精度，未实现的功能不承诺。
@@ -20,15 +20,14 @@ apt-get install -y python3-numpy
 
 已有依赖（无需安装）：
 
-- **pyserial**（import 名为 `serial`，实测 3.5）：GPS 串口读取
-- **smbus2**：IMU I2C 读取
+- **pyserial**（import 名为 `serial`，实测 3.5）：GPS 串口读取 + WitMotion IMU 串口读取
 
 ### 模块清单与职责
 
 | 文件 | 职责 |
 |---|---|
 | `gps_reader.py` | GPS 读取。pyserial + NMEA 解析，`/dev/ttyACM0` @ 115200，1 Hz；门控 fix≥1 且 HDOP<2.0 |
-| `imu_reader.py` | IMU 读取。smbus2，i2c-2 @ 0x68；量程 ±500 dps / ±4 g；FIFO 12 字节包；启动 10 s 校准；i2c 停顿时间戳回推 |
+| `imu_reader.py` | IMU 读取。WitMotion WT901SDCL 串口读取（pyserial, 0x55 协议, 50Hz, ±16g/±2000dps, 自动探测+配置, 启动 10s 校准, 串口积压时间戳回推） |
 | `attitude.py` | 姿态估计。Madgwick 自适应互补滤波，roll/pitch/yaw（ZYX）；无磁力计，yaw 为纯陀螺积分 |
 | `ekf.py` | 9 状态扩展卡尔曼滤波（ENU 位置/速度 + 加速度零偏），GPS 位置/速度 + ZUPT 更新，chi-square 野值拒绝 |
 | `geo.py` | WGS84 ↔ ENU 坐标转换；survey-in 原点计算 |
@@ -72,11 +71,11 @@ python3 recorder.py --duration 1800 --out runs/
 - 正常跑满 `--duration` 也会自动结束。
 - 不建议 kill -9：会跳过尾部完整性检查与 meta 收尾。
 
-### FIFO 与零丢弃说明
+### 串口缓冲与零丢弃说明
 
-- 校准完成后 IMU 线程**立即启动并持续读取**，首个 fix 等待与 survey-in 期间持续 drain FIFO，防止 1024 字节 FIFO 溢出。该克隆芯片 FIFO 溢出不是丢数而是 8 字节指针错位（通道置换），系统已内置防护。
+- 校准完成后 IMU 线程**立即启动并持续读取**，首个 fix 等待与 survey-in 期间持续 drain 串口缓冲（内核缓冲约 4 KB，50Hz × 22 字节 ≈ 1.1 KB/s，正常不丢数），防止缓冲积压导致读取时间戳延迟。
 - 正常录制 `meta.json` 中 `dropped.imu` / `dropped.gps` 应为 0。实测 60 s 与 300 s 长稳录制均为 0。
-- i2c 偶发停顿（GPS 串口并发时单次事务 20~43 ms）不丢样本：程序按剩余 FIFO 深度把读取时间戳回推到生产时刻（见 meta `backdated` 字段）。
+- 串口读取偶发停顿（GPS 串口并发时单次读取 20~43 ms）不丢样本：程序按串口 RX 积压字节数把读取时间戳回推到生产时刻（见 meta `backdated` 字段）。
 
 ---
 
@@ -118,13 +117,13 @@ python3 recorder.py --duration 1800 --out runs/
 | `calibration` | `{n_samples, duration_s}`：校准样本数与时长 |
 | `sample_rate` / `duration` | 实测采样率（Hz）与实际跨度（s），会覆盖 validate 的 CLI 默认 |
 | `planned_duration` / `nominal_rate` | 计划时长与标称采样率 |
-| `imu` / `gps` | 硬件配置（量程、DLPF、i2c 总线/地址；串口、波特率、fix/HDOP 门限） |
+| `imu` / `gps` | 硬件配置（型号、接口、量程、输出率；串口、波特率、fix/HDOP 门限） |
 | `start_time` / `stop_time` | 起止时刻（板时区 UTC，ISO 8601） |
 | `rows` | 实际行数 |
 | `dropped` | `{imu, gps}` 丢弃计数（0=零丢弃） |
 | `coast` | `{rows, seconds, gps_rejected_events}`：GPS 失效段统计 |
 | `zupt` | `{active_rows}`：ZUPT 生效行数 |
-| `backdated` | `{samples, max_backdate_ms, dt_ema_ms}`：i2c 停顿时间戳回推统计 |
+| `backdated` | `{samples, max_backdate_ms, dt_ema_ms}`：串口积压时间戳回推统计 |
 | `rate_warnings` / `numpy` / `stop_reason` | 采样率告警数、numpy 是否可用、结束原因（如 signal(15)=Ctrl+C） |
 
 ---
@@ -207,11 +206,11 @@ python3 analyze.py $CSV --metric attitude_static           # 姿态门限
 **Q1. GPS 无 fix，程序卡在等待。**
 遮挡（室内/高墙）或冷启动都会导致无 fix。确认天线朝天、`/dev/ttyACM0` 存在、HDOP < 2.0。冷启动最长等 30 s；仍无则检查串口接线与供电。
 
-**Q2. IMU FIFO 溢出 / 通道错乱。**
-系统已内置启动期持续 drain 与溢出防护，正常不会发生。若 `dropped.imu > 0` 或 a_mag 异常（静止时远小于 9.81），检查 i2c 接线、电源纹波，并避免录制期间其他进程并发访问 i2c-2 总线。
+**Q2. IMU 串口读取卡顿 / 数据错乱。**
+系统已内置启动期持续 drain 与防积压处理，正常不会发生。若 `dropped.imu > 0` 或 a_mag 异常（静止时远小于 9.81），检查 USB 数据线、供电，并避免录制期间其他进程并发占用串口设备。
 
 **Q3. 采样率不足 / validate 报 rate FAIL。**
-实测 ~50.6 Hz。若均值偏离 50 ±2 Hz 或 p95 jitter ≥5 ms，多为 i2c 总线繁忙或接线质量差；查看 meta `backdated.max_backdate_ms`，停顿过大说明总线受干扰。校准阶段重跑一次可复现即可定位。
+实测 ~50.6 Hz。若均值偏离 50 ±2 Hz 或 p95 jitter ≥5 ms，多为 USB 串口占用或供电不足；查看 meta `backdated.max_backdate_ms`，停顿过大说明串口读取受干扰。校准阶段重跑一次可复现即可定位。
 
 **Q4. HDOP 劣化怎么办。**
 HDOP ≥ 2.0 时该 GPS 观测被门控拒绝，行进入 coast（zupt=2），轨迹退化为纯 IMU 积分，位置随积分时间漂移。改善天线环境后重录；分析时注意 coast 段精度下降。
@@ -229,7 +228,7 @@ HDOP ≥ 2.0 时该 GPS 观测被门控拒绝，行进入 coast（zupt=2），�
 | 项目 | 实测值 |
 |---|---|
 | GPS 端口/波特率 | /dev/ttyACM0 @ 115200，1 Hz，HDOP 0.83~1.59，12 星 |
-| IMU | i2c-2 @ 0x68，±500 dps / ±4 g，DLPF=4，FIFO 12 字节包 |
+| IMU | WitMotion WT901SDCL，USB 串口，±2000 dps / ±16 g，50 Hz |
 | 采样率 | ~50.6 Hz（标称 50Hz） |
 | 60 s 静态 validate | 8/8 PASS，dropped=0 |
 | 静态漂移 | 水平 1.69~2.85 m / 垂直 0.56~1.95 m，末速 0.000 m/s |

@@ -68,8 +68,8 @@ roll ≈ 153°），绝对姿态静止时恒为 ~153°，`attitude_static` 指�
   "planned_duration": 1800.0,
   "multipath_rejected": 0,
   "nominal_rate":  50.0,
-  "imu":           {"accel_range": "4g", "gyro_range": "500dps",
-                    "dlpf_cfg": 4, "i2c_bus": 2, "i2c_addr": 104},
+  "imu":           {"model": "WitMotion WT901SDCL", "interface": "uart",
+                    "accel_range": "16g", "gyro_range": "2000dps", "output_rate_hz": 50},
   "gps":           {"port": "/dev/ttyACM0", "baud": 115200,
                     "fix_min": 1, "hdop_max": 2.0},
   "start_time":    "2026-08-24T12:00:00.000+08:00"
