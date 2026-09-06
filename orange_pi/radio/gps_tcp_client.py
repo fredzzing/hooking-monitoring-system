@@ -6,7 +6,8 @@
 3. 接收服务器返回的远程机坐标，计算与本机的相对位置（距离、方位角、东西/南北偏移）。
 
 发送节奏（RADIO_NETWORK_SPEC §4）：
-- GPS 时间可用且新鲜（≤2s）时，POS 在 GPS 秒边界 + 0.35s 相位发射（1Hz，与船 USV 错峰）；
+- 默认不发 POS（吊物仅任务期上线）；`--pos-tx` 启动即发，或收 `HOOK_TX ON/OFF` 切换。
+- GPS 时间可用且新鲜（≤2s）时，POS 在 GPS 秒边界 + 0.45s 相位发射（1Hz；短 USV 后 / POS 前与 POS 后留给岸 VEL）；
 - GPS 时间不可用/过期时，退化为墙钟 1Hz + ±50ms 随机抖动。
 
 依赖：pip install pyserial
@@ -24,8 +25,8 @@ from typing import Optional
 
 EARTH_RADIUS = 6371000.0  # 地球平均半径（米）
 
-# ---- RADIO_NETWORK_SPEC §4 发送时序参数（POS：GPS 秒边界 + 0.35s，1Hz）----
-PHASE_OFFSET = 0.35      # POS 相位偏移（秒）：GPS 秒边界 + 0.35s，与船 USV（0.0）错峰
+# ---- RADIO_NETWORK_SPEC §4：POS = GPS 秒 + 0.45s；VEL∈[0.22,0.42)∪[0.62,0.95) ----
+PHASE_OFFSET = 0.45  # GPS 秒 + 0.45；短 USV≈0–0.18，其间/其后给岸 VEL
 MAX_ALIGN_SLEEP = 0.9    # 对齐 sleep 单次上界（秒），留余量；越界/过期为负立即发送不累积
 FIX_STALE_LIMIT = 2.0    # fix 新鲜度窗口（秒）；GPS 时间超期视为不可用
 WALL_JITTER = 0.05       # 无 GPS 秒退化：墙钟 ±50ms 随机抖动
@@ -147,6 +148,7 @@ remote_pos = None   # type: Optional[dict]
 pos_lock = threading.Lock()
 last_data_time = None   # 最后一次从串口收到任何数据的时间
 last_fix_time = None    # 最后一次解析出有效定位的时间
+pos_tx_enabled = threading.Event()  # 任务期才发 POS；默认关闭
 
 
 # ---------------- 线程：串口读取 GPS ----------------
@@ -179,13 +181,17 @@ def gps_reader(ser: serial.Serial, debug: bool = False) -> None:
 def position_sender(sock: socket.socket, interval: float, stop: threading.Event) -> None:
     """周期发送本机位置（RADIO_NETWORK_SPEC §4）。
 
-    GPS 时间可用且新鲜（last_fix_time 距今 ≤2s 且 pos 含 utc_seconds）时：
-    在 GPS 秒边界 + 0.35s 相位发送（1Hz）；GPS 时间不可用/过期时退化为
-    墙钟 1Hz + ±50ms 随机抖动。POS 报文格式不变（三端契约）。
+    仅当 ``pos_tx_enabled`` 置位（任务期 / ``--pos-tx``）时发送。
+    GPS 新鲜时：GPS 秒边界 + PHASE_OFFSET(0.45)；否则墙钟 1Hz ±50ms。
     """
     last_sent_utc = None  # 上次发送对应的目标 GPS 秒（避免同一秒重复发送）
 
     while not stop.is_set():
+        if not pos_tx_enabled.is_set():
+            # 非任务期静默，降低半双工占用
+            stop.wait(0.2)
+            continue
+
         with pos_lock:
             pos = local_pos
             fix_at = last_fix_time
@@ -200,20 +206,21 @@ def position_sender(sock: socket.socket, interval: float, stop: threading.Event)
                   and entered - fix_at <= FIX_STALE_LIMIT)
 
         if gps_ok:
-            # ---- GPS 秒边界对齐路径（秒边界 + 0.35s 相位）----
-            # 下一次发送时刻（GPS 秒）：ceil(utc / interval) * interval + PHASE_OFFSET
+            # ---- GPS 秒边界对齐路径（秒边界 + PHASE_OFFSET）----
             next_utc = math.ceil(utc / interval) * interval + PHASE_OFFSET
             if last_sent_utc is not None and next_utc <= last_sent_utc:
                 next_utc += interval  # 该目标已错过/已发，推进到下一个周期边界
-            # 映射到墙钟：fix 时刻墙钟与 GPS 秒的差 = fix_at - utc
             target_wall = fix_at + (next_utc - utc)
             delta = target_wall - time.time()
-            # sleep 到 target_wall；单次 sleep 上界 0.9s 分步逼近，越界/过期为负立即发送不累积
             while delta > 0 and not stop.is_set():
+                if not pos_tx_enabled.is_set():
+                    break
                 stop.wait(min(delta, MAX_ALIGN_SLEEP))
                 delta = target_wall - time.time()
             if stop.is_set():
                 return
+            if not pos_tx_enabled.is_set():
+                continue
             waited = time.time() - entered
             msg = f"POS {pos['lat']:.7f} {pos['lon']:.7f} {pos['alt']:.1f}\n"
             try:
@@ -230,6 +237,8 @@ def position_sender(sock: socket.socket, interval: float, stop: threading.Event)
             jitter = random.uniform(-WALL_JITTER, WALL_JITTER)
             if stop.wait(max(interval + jitter, 0.0)):
                 return
+            if not pos_tx_enabled.is_set():
+                continue
             msg = f"POS {pos['lat']:.7f} {pos['lon']:.7f} {pos['alt']:.1f}\n"
             try:
                 sock.sendall(msg.encode("ascii"))
@@ -257,7 +266,23 @@ def remote_receiver(sock: socket.socket, stop: threading.Event) -> None:
         buffer += data
         while b"\n" in buffer:
             line, buffer = buffer.split(b"\n", 1)
-            parts = line.decode("utf-8", errors="replace").split()
+            text = line.decode("utf-8", errors="replace").strip()
+            parts = text.split()
+            if not parts:
+                continue
+            # 任务开关：HOOK_TX ON|OFF 或 CMD [seq] HOOK_TX ON|OFF
+            if parts[0] == "HOOK_TX" and len(parts) >= 2:
+                _apply_hook_tx(parts[1])
+                continue
+            if parts[0] == "CMD":
+                rest = parts[1:]
+                if rest and rest[0].isdigit():
+                    rest = rest[1:]
+                if len(rest) >= 2 and rest[0] == "HOOK_TX":
+                    _apply_hook_tx(rest[1])
+                continue
+            if parts[0] in ("USV", "ACK", "NODE"):
+                continue
             # 协议: "POS lat lon [alt]" 或 "lat lon"
             if len(parts) >= 3 and parts[0] == "POS":
                 parts = parts[1:]
@@ -283,6 +308,19 @@ def remote_receiver(sock: socket.socket, stop: threading.Event) -> None:
                 print("[相对位置] 本机 GPS 尚未定位，无法计算")
 
 
+def _apply_hook_tx(token: str) -> None:
+    """Enable/disable POS TX from radio command."""
+    flag = token.strip().upper()
+    if flag in ("ON", "1", "TRUE", "START"):
+        pos_tx_enabled.set()
+        print("[HOOK_TX] POS transmit ON (task)", flush=True)
+    elif flag in ("OFF", "0", "FALSE", "STOP"):
+        pos_tx_enabled.clear()
+        print("[HOOK_TX] POS transmit OFF (idle)", flush=True)
+    else:
+        print(f"[HOOK_TX] ignore unknown token '{token}'", flush=True)
+
+
 # ---------------- 主函数 ----------------
 
 def main() -> None:
@@ -292,9 +330,19 @@ def main() -> None:
     parser.add_argument("--host", required=True, help="服务器 IP 地址")
     parser.add_argument("--port", type=int, required=True, help="服务器端口")
     parser.add_argument("--interval", type=float, default=1.0,
-                        help="位置上报周期(秒)，默认 1.0（GPS 秒边界+0.35s 相位错峰）")
+                        help="位置上报周期(秒)，默认 1.0（GPS 秒边界+0.45s 相位错峰）")
+    parser.add_argument(
+        "--pos-tx",
+        action="store_true",
+        help="启动即发送 POS；默认关闭，仅任务期发（也可用 HOOK_TX ON 打开）",
+    )
     parser.add_argument("--debug", action="store_true", help="打印串口收到的所有原始 NMEA 报文")
     args = parser.parse_args()
+    if args.pos_tx:
+        pos_tx_enabled.set()
+        print("[HOOK_TX] --pos-tx: POS transmit enabled at start")
+    else:
+        print("[HOOK_TX] POS transmit OFF until HOOK_TX ON / --pos-tx")
 
     try:
         ser = serial.Serial(args.serial, args.baud, timeout=1)
